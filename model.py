@@ -1,60 +1,50 @@
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModel
 
 
-def build_2d_sincos_position_embedding(
-    grid_size,
-    embed_dim,
-    device=None,
-):
-    """Generate a 2D sin-cos positional embedding."""
-    grid_h, grid_w = grid_size
-    grid_y, grid_x = torch.meshgrid(
-        torch.linspace(0, 1, grid_h, dtype=torch.float32, device=device),
-        torch.linspace(0, 1, grid_w, dtype=torch.float32, device=device),
-        indexing="ij",
-    )
-    omega = torch.arange(embed_dim // 4, dtype=torch.float32, device=device)
-    omega = 1.0 / (10000 ** (omega / (embed_dim // 4)))
-
-    out_y = torch.einsum("hw,d->hwd", grid_y, omega)
-    out_x = torch.einsum("hw,d->hwd", grid_x, omega)
-
-    pos_y = torch.cat([out_y.sin(), out_y.cos()], dim=-1)
-    pos_x = torch.cat([out_x.sin(), out_x.cos()], dim=-1)
-    pos = torch.cat([pos_y, pos_x], dim=-1)
-    pos = pos.view(grid_h * grid_w, embed_dim)
-    return pos
-
-
-class FrozenGemmaTextEncoder(nn.Module):
-    def __init__(self, model_name="google/gemma-2b", trust_remote_code=False):
+class SmallTextEncoder(nn.Module):
+    """Small trainable text encoder - balanced with vision encoder"""
+    def __init__(self, vocab_size, embed_dim=256, depth=4, num_heads=8, max_seq_len=512):
         super().__init__()
-        self.model = AutoModel.from_pretrained(
-            model_name,
-            output_hidden_states=False,
-            trust_remote_code=trust_remote_code,
+        self.vocab_size = vocab_size
+        self.embedding_dim = embed_dim
+        
+        # Token embeddings
+        self.token_embedding = nn.Embedding(vocab_size, embed_dim)
+        
+        # Positional embeddings
+        self.positional_embedding = nn.Parameter(torch.randn(1, max_seq_len, embed_dim) * 0.02)
+        
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=int(embed_dim * 4),
+            dropout=0.0,
+            batch_first=True,
+            activation="gelu",
         )
-        self.model.eval()
-        for param in self.model.parameters():
-            param.requires_grad = False
-
-        embeddings = self.model.get_input_embeddings()
-        self.embedding_dim = embeddings.embedding_dim
-        self.vocab_size = embeddings.num_embeddings
-        self.register_buffer("_embedding_weight", embeddings.weight.detach().clone())
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+        self.layer_norm = nn.LayerNorm(embed_dim)
 
     def forward(self, input_ids, attention_mask=None):
-        with torch.no_grad():
-            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-        return outputs.last_hidden_state
-
-    def get_embedding_weight(self):
-        return self._embedding_weight
+        seq_len = input_ids.size(1)
+        
+        # Get token embeddings
+        embeddings = self.token_embedding(input_ids)
+        
+        # Add positional embeddings
+        embeddings = embeddings + self.positional_embedding[:, :seq_len, :]
+        
+        # Create padding mask for transformer
+        src_key_padding_mask = None
+        if attention_mask is not None:
+            src_key_padding_mask = (attention_mask == 0)
+        
+        # Encode
+        encoded = self.encoder(embeddings, src_key_padding_mask=src_key_padding_mask)
+        return self.layer_norm(encoded)
 
 
 class VisionTransformerEncoder(nn.Module):
@@ -71,11 +61,14 @@ class VisionTransformerEncoder(nn.Module):
         super().__init__()
         h, w = image_size
         assert h % patch_size == 0 and w % patch_size == 0, "Image dimensions must be divisible by patch size."
-        self.grid_size = (h // patch_size, w // patch_size)
-        self.num_patches = self.grid_size[0] * self.grid_size[1]
+        self.num_patches = (h // patch_size) * (w // patch_size)
         self.embed_dim = embed_dim
 
         self.patch_embed = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
+        
+        # Learnable positional embeddings
+        self.positional_embedding = nn.Parameter(torch.randn(1, self.num_patches, embed_dim) * 0.02)
+        
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=num_heads,
@@ -85,10 +78,6 @@ class VisionTransformerEncoder(nn.Module):
             activation="gelu",
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=depth)
-        self.positional_embedding = nn.Parameter(
-            build_2d_sincos_position_embedding(self.grid_size, embed_dim),
-            requires_grad=False,
-        )
         self.layer_norm = nn.LayerNorm(embed_dim)
 
     def forward(self, pixel_values):
@@ -97,40 +86,18 @@ class VisionTransformerEncoder(nn.Module):
         patches = patches.flatten(2).transpose(1, 2)
         if h * w != self.num_patches:
             raise ValueError("Input resolution does not match initialized positional embeddings.")
-        patches = patches + self.positional_embedding.unsqueeze(0)
+        patches = patches + self.positional_embedding
         encoded = self.encoder(patches)
         return self.layer_norm(encoded)
-
-
-class CrossModalAttentionBlock(nn.Module):
-    def __init__(self, embed_dim, num_heads):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=0.0, batch_first=True)
-        self.norm = nn.LayerNorm(embed_dim)
-
-    def forward(
-        self,
-        queries,
-        keys,
-        values,
-        key_padding_mask=None,
-    ):
-        attn_output, _ = self.attn(
-            queries,
-            keys,
-            values,
-            key_padding_mask=key_padding_mask,
-            need_weights=False,
-        )
-        queries = queries + attn_output
-        return self.norm(queries)
 
 
 class DiagramExplainerModel(nn.Module):
     def __init__(
         self,
-        gemma_model_name="google/gemma-3-270m",
-        trust_remote_code=False,
+        vocab_size=256000,
+        text_embed_dim=256,
+        text_depth=4,
+        text_heads=8,
         image_size=(224, 224),
         patch_size=16,
         vision_embed_dim=256,
@@ -143,7 +110,12 @@ class DiagramExplainerModel(nn.Module):
         decoder_mlp_ratio=4.0,
     ):
         super().__init__()
-        self.text_encoder = FrozenGemmaTextEncoder(gemma_model_name, trust_remote_code=trust_remote_code)
+        self.text_encoder = SmallTextEncoder(
+            vocab_size=vocab_size,
+            embed_dim=text_embed_dim,
+            depth=text_depth,
+            num_heads=text_heads,
+        )
         text_dim = self.text_encoder.embedding_dim
         vocab_size = self.text_encoder.vocab_size
 
@@ -157,7 +129,10 @@ class DiagramExplainerModel(nn.Module):
         self.image_projection = nn.Linear(vision_embed_dim, fusion_dim)
 
         self.text_projection = nn.Linear(text_dim, fusion_dim)
-        self.cross_attention = CrossModalAttentionBlock(fusion_dim, fusion_heads)
+        
+        # Cross-modal attention (text attends to image)
+        self.cross_attention = nn.MultiheadAttention(fusion_dim, fusion_heads, dropout=0.0, batch_first=True)
+        self.cross_attention_norm = nn.LayerNorm(fusion_dim)
 
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=fusion_dim,
@@ -169,13 +144,13 @@ class DiagramExplainerModel(nn.Module):
         )
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=decoder_layers)
 
-        token_embedding = self.text_encoder.get_embedding_weight()
-        self.token_embedding = nn.Embedding.from_pretrained(token_embedding, freeze=False)
-        self.decoder_input_projection = nn.Linear(self.token_embedding.embedding_dim, fusion_dim)
-        self.decoder_output_projection = nn.Linear(fusion_dim, self.token_embedding.embedding_dim)
+        # Decoder uses same embeddings as text encoder
+        self.decoder_input_projection = nn.Linear(text_dim, fusion_dim)
+        self.decoder_output_projection = nn.Linear(fusion_dim, text_dim)
 
-        self.output_head = nn.Linear(self.token_embedding.embedding_dim, vocab_size, bias=False)
-        self.output_head.weight = self.token_embedding.weight
+        # Output head shares weights with text encoder embeddings
+        self.output_head = nn.Linear(text_dim, vocab_size, bias=False)
+        self.output_head.weight = self.text_encoder.token_embedding.weight
         
         # Initialize weights
         self.apply(self._init_weights)
@@ -210,13 +185,16 @@ class DiagramExplainerModel(nn.Module):
         text_embeddings = self.text_encoder(encoder_input_ids, attention_mask=encoder_attention_mask)
         text_embeddings = self.text_projection(text_embeddings)
 
-        fused_embeddings = self.cross_attention(
-            queries=text_embeddings,
-            keys=image_features,
-            values=image_features,
+        # Cross-modal attention: text attends to image
+        attn_output, _ = self.cross_attention(
+            query=text_embeddings,
+            key=image_features,
+            value=image_features,
+            need_weights=False,
         )
+        fused_embeddings = self.cross_attention_norm(text_embeddings + attn_output)
 
-        decoder_embeddings = self.token_embedding(decoder_input_ids)
+        decoder_embeddings = self.text_encoder.token_embedding(decoder_input_ids)
         decoder_embeddings = self.decoder_input_projection(decoder_embeddings)
 
         tgt_mask = self._generate_square_subsequent_mask(decoder_embeddings.size(1), decoder_embeddings.device)

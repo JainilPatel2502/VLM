@@ -51,11 +51,9 @@ IMAGE_SIZE = 224
 
 
 def load_checkpoint(checkpoint_path, device):
-    """Load model from checkpoint."""
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    model_name = checkpoint.get("model_name", "google/gemma-3-270m")
-    print(f"Loaded checkpoint: model={model_name}, step={checkpoint.get('global_step', 0)}")
-    return checkpoint, model_name
+    print(f"Loaded checkpoint: step={checkpoint.get('global_step', 0)}")
+    return checkpoint
 
 
 def prepare_image(image_path, image_size=(224, 224)):
@@ -109,46 +107,48 @@ def generate_caption(model, tokenizer, image_tensor, encoder_text, max_length=12
         return tokenizer.decode(generated_tokens, skip_special_tokens=True)
 
 
-def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    
-    checkpoint, model_name = load_checkpoint(CHECKPOINT_PATH, device)
-    tokenizer = build_tokenizer(model_name)
-    
-    model = DiagramExplainerModel(
-        gemma_model_name=model_name,
-        image_size=(IMAGE_SIZE, IMAGE_SIZE),
-        patch_size=16,
-        vision_embed_dim=256,
-        vision_depth=6,
-        vision_heads=8,
-        fusion_dim=384,
-        fusion_heads=6,
-        decoder_layers=4,
-        decoder_heads=6,
-        decoder_mlp_ratio=4.0,
-    ).to(device)
-    
-    model.load_state_dict(checkpoint["model_state_dict"])
-    print("Model loaded!\n")
-    
-    print(f"Image: {IMAGE_PATH}")
-    print(f"Text: {INPUT_TEXT[:80]}...")
-    print("\nGenerating caption...\n")
-    
-    image_tensor = prepare_image(IMAGE_PATH, image_size=(IMAGE_SIZE, IMAGE_SIZE))
-    caption = generate_caption(model, tokenizer, image_tensor, INPUT_TEXT, MAX_LENGTH, TEMPERATURE, device)
-    
-    print(f"Generated Caption:\n>>> {caption}")
-    
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
+checkpoint = load_checkpoint(CHECKPOINT_PATH, device)
+tokenizer = build_tokenizer()
+
+model = DiagramExplainerModel(
+    vocab_size=8192,  # Custom tokenizer vocabulary size
+    text_embed_dim=256,
+    text_depth=8,  # Deeper text encoder
+    text_heads=8,
+    image_size=(IMAGE_SIZE, IMAGE_SIZE),
+    patch_size=16,
+    vision_embed_dim=256,
+    vision_depth=8,  # Deeper vision encoder
+    vision_heads=8,
+    fusion_dim=256,
+    fusion_heads=4,
+    decoder_layers=4,  # Deeper decoder
+    decoder_heads=4,
+    decoder_mlp_ratio=3.0,
+).to(device)
+
+model.load_state_dict(checkpoint["model_state_dict"])
+print("Model loaded!\n")
+
+print(f"Image: {IMAGE_PATH}")
+print(f"Text: {INPUT_TEXT[:80]}...")
+print("\nGenerating caption...\n")
+
+image_tensor = prepare_image(IMAGE_PATH, image_size=(IMAGE_SIZE, IMAGE_SIZE))
+caption = generate_caption(model, tokenizer, image_tensor, INPUT_TEXT, MAX_LENGTH, TEMPERATURE, device)
+
+print(f"Generated Caption:\n>>> {caption}")
+
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
 
 
-if __name__ == "__main__":
-    main()
+
 
